@@ -90,9 +90,12 @@ class SonicTrainer(Trainer):
         return self.cfg.model # type: ignore
     
     def init_qwen3vl_models(self):
+        # flash_attention_2 when available, otherwise sdpa (same fallback as models/psi0.py)
+        from transformers.utils import is_flash_attn_2_available
+        attn_impl = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
         vlm_model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_cfg.model_name_or_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
             dtype=torch.bfloat16
         )
         overwatch.info(f"Load pretrained VLM model from {self.model_cfg.model_name_or_path}")
