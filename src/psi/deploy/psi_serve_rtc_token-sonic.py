@@ -173,8 +173,12 @@ class Server:
         ckpt_step: int | str  = "latest", 
         device: str = "cuda:0", 
         enable_rtc: bool = False,
-        action_exec_horizon: int | None = None
+        action_exec_horizon: int | None = None,
+        ctrl_hz: float = 30.0,
     ):
+        # ctrl_hz must match the fps the training data was recorded at (SONIC
+        # deploy-collections vary: 30 or 50), or actions replay at the wrong speed.
+        self.ctrl_period_sec = 1.0 / ctrl_hz
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available. Please check your CUDA installation.")
         
@@ -461,7 +465,7 @@ class Server:
             # print(f"[control loop] step took {elapsed:.1f}ms, version={self.action_version}")
             
             # 5. Wait until next ctrl period
-            next_tick += CTRL_PERIOD_SEC
+            next_tick += self.ctrl_period_sec
             sleep_time = next_tick - time.perf_counter()
             now = time.perf_counter()
             interval = now - prev_tick
@@ -506,7 +510,8 @@ def serve(cfg: ServerConfig) -> None:
         cfg.ckpt_step, 
         cfg.device,
         cfg.rtc,
-        cfg.action_exec_horizon)
+        cfg.action_exec_horizon,
+        ctrl_hz=cfg.ctrl_hz)
     
     print("Server :: Spinning Up")
     server.run(cfg.host, cfg.port)

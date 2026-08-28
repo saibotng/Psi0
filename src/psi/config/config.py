@@ -117,8 +117,9 @@ class ServerConfig(BaseModel):
     policy: str | None = None
     action_exec_horizon: int | None = None
     rtc: bool = False
-    run_dir: str 
-    ckpt_step: int 
+    run_dir: str
+    ckpt_step: int
+    ctrl_hz: float = 30.0  # action replay rate; must match the training data's fps
 
     @model_validator(mode="after")
     def set_policy(self):

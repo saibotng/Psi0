@@ -11,5 +11,6 @@ python src/psi/deploy/psi_serve_rtc_token-sonic.py \
     --action_exec_horizon 30 \
     --policy psi \
     --rtc \
+    --ctrl-hz=${CTRL_HZ:-30} \
     --run-dir=${CHECKPOINT_DIR} \
     --ckpt-step=${CHECKPOINT_STEP}

@@ -31,7 +31,10 @@ NC='\033[0m' # No Color
 # GR00T-WholeBodyControl submodule's gear_sonic_deploy/. cd there so every
 # relative path below resolves correctly.
 LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_DIR="$(cd "$LAUNCHER_DIR/../../third_party/GR00T-WholeBodyControl/gear_sonic_deploy" && pwd)"
+# SONIC_DIR: override when the GR00T-WholeBodyControl checkout lives elsewhere
+# (default: the third_party submodule next to this repo)
+SONIC_DIR="${SONIC_DIR:-$LAUNCHER_DIR/../../third_party/GR00T-WholeBodyControl}"
+SCRIPT_DIR="$(cd "$SONIC_DIR/gear_sonic_deploy" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ============================================================================
