@@ -17,7 +17,8 @@ from huggingface_hub import create_repo, create_tag, upload_large_folder
 from tqdm import tqdm
 
 CODE_VERSION = "v2.1"
-FPS = 30
+DEFAULT_FPS = 30            # fallback when the source meta has no fps
+DEFAULT_VIDEO_SHAPE = [480, 640, 3]
 
 # disable_progress_bar()
 set_verbosity_error()
@@ -108,6 +109,8 @@ class Sonic2LeRobotConverter:
         self.episode_sources: List[Tuple[int, Path, Path, int]] = []  # (task_idx, parquet, video, out_ep)
         self.lengths_by_episode: Dict[int, int] = {}
         self.chunks_size: int = 1000
+        self.fps: int = DEFAULT_FPS                       # taken from the source meta in run()
+        self.video_shape: List[int] = DEFAULT_VIDEO_SHAPE
 
     def build_obs(self, state43: np.ndarray) -> Dict[str, Any]:
         states = np.concatenate([take_slices(state43, QPOS_SLICES), take_slices(state43, HAND_SLICES)])
@@ -147,7 +150,7 @@ class Sonic2LeRobotConverter:
                 {
                     **self.build_obs(state[i]),
                     "action": self.build_act(token[i], wbc[i]),
-                    "timestamp": i * (1.0 / FPS),
+                    "timestamp": i * (1.0 / self.fps),
                     "frame_index": i,
                     "episode_index": episode_index,
                     "index": i,
@@ -175,17 +178,27 @@ class Sonic2LeRobotConverter:
                     "count": [n],
                 },
                 "timestamp": {
-                    "min": [0.0], "max": [(n - 1) / FPS],
-                    "mean": [((n - 1) / 2) / FPS],
-                    "std": [n / (2 * FPS * math.sqrt(3))], "count": [n],
+                    "min": [0.0], "max": [(n - 1) / self.fps],
+                    "mean": [((n - 1) / 2) / self.fps],
+                    "std": [n / (2 * self.fps * math.sqrt(3))], "count": [n],
                 },
             },
         }
         append_jsonl_line_atomic(out_base.parent / "meta" / "episodes_stats.jsonl", episode_stats)
         return episode_index, n
 
-    def run(self, data_root: Path, work_dir: Path, chunks_size: int, num_workers: int, robot_type: str):
+    def run(self, data_root: Path, work_dir: Path, chunks_size: int, num_workers: int, robot_type: str,
+            fps: int | None = None):
         self.chunks_size = chunks_size
+
+        # fps and video shape come from the source recording (SONIC exports at whatever
+        # --data-exporter-frequency was used, e.g. 30 or 50); the video is copied verbatim,
+        # so the output meta must match it or LeRobot's timestamp-based decoding breaks.
+        src_info = json.loads((data_root / "meta" / "info.json").read_text())
+        self.fps = fps or src_info.get("fps") or DEFAULT_FPS
+        src_video_meta = src_info.get("features", {}).get(SRC_VIDEO_KEY, {})
+        self.video_shape = list(src_video_meta.get("shape") or DEFAULT_VIDEO_SHAPE)
+        print(f"Source fps: {self.fps}, video shape: {self.video_shape}")
         data_dir = work_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -262,12 +275,12 @@ class Sonic2LeRobotConverter:
         tasks_df = pd.DataFrame(task_rows).sort_values("task_index").reset_index(drop=True)
 
         video_info = {
-            "video.fps": float(FPS), "video.codec": "h264", "video.pix_fmt": "yuv420p",
+            "video.fps": float(self.fps), "video.codec": "h264", "video.pix_fmt": "yuv420p",
             "video.is_depth_map": False, "has_audio": False,
         }
         features_meta = {
             "observation.images.egocentric": {
-                "dtype": "video", "shape": [480, 640, 3],
+                "dtype": "video", "shape": self.video_shape,
                 "names": ["height", "width", "channel"], "video_info": video_info,
             },
             "states": {"dtype": "float32", "shape": [-1]},
@@ -289,7 +302,7 @@ class Sonic2LeRobotConverter:
             total_videos=self.num_episodes,
             total_chunks=math.ceil(self.num_episodes / self.chunks_size),
             chunks_size=self.chunks_size,
-            fps=FPS,
+            fps=self.fps,
             data_path="data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
             video_path="videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
             features=features_meta,
@@ -318,6 +331,8 @@ def main():
     parser.add_argument("--repo-exist-ok", action="store_true")
     parser.add_argument("--num-workers", type=int, default=os.cpu_count(), help="Max parallel workers")
     parser.add_argument("--robot-type", type=str, choices=["g1"], default="g1")
+    parser.add_argument("--fps", type=int, default=None,
+                        help="Override output fps; default: the source dataset's meta fps")
     args = parser.parse_args()
 
     data_root = Path(args.data_root).expanduser().resolve()
@@ -328,7 +343,7 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     pipeline = Sonic2LeRobotConverter()
-    pipeline.run(data_root, work_dir, args.chunks_size, args.num_workers, args.robot_type)
+    pipeline.run(data_root, work_dir, args.chunks_size, args.num_workers, args.robot_type, fps=args.fps)
     pipeline.write_meta(work_dir)
 
     if args.push:
