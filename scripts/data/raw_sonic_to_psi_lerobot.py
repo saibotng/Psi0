@@ -92,7 +92,12 @@ class Sonic2LeRobotConverter:
     ``observation.images.egocentric`` video. Frames are kept 1:1; video is copied.
     """
 
-    def __init__(self):
+    def __init__(self, zero_hands: bool = False):
+        # zero_hands: robot has no dex hands attached; recorded hand values are either
+        # all-zero anyway or spurious teleop commands into the void — zero both the
+        # hand state and hand action slices so they become constant dims that the
+        # training-side bounds normalization ignores (ill_mask) instead of noise targets.
+        self.zero_hands = zero_hands
         self.features = Features(
             {
                 "states": Sequence(Value("float32")),
@@ -113,11 +118,17 @@ class Sonic2LeRobotConverter:
         self.video_shape: List[int] = DEFAULT_VIDEO_SHAPE
 
     def build_obs(self, state43: np.ndarray) -> Dict[str, Any]:
-        states = np.concatenate([take_slices(state43, QPOS_SLICES), take_slices(state43, HAND_SLICES)])
+        hands = take_slices(state43, HAND_SLICES)
+        if self.zero_hands:
+            hands = np.zeros_like(hands)
+        states = np.concatenate([take_slices(state43, QPOS_SLICES), hands])
         return {"states": states.astype(np.float32).tolist()}  # 29 + 14 = 43
 
     def build_act(self, token64: np.ndarray, wbc43: np.ndarray) -> List[float]:
-        action = np.concatenate([token64, take_slices(wbc43, HAND_SLICES)])
+        hands = take_slices(wbc43, HAND_SLICES)
+        if self.zero_hands:
+            hands = np.zeros_like(hands)
+        action = np.concatenate([token64, hands])
         return action.astype(np.float32).tolist()  # 64 + 14 = 78
 
     def make_one_episode(
@@ -333,6 +344,9 @@ def main():
     parser.add_argument("--robot-type", type=str, choices=["g1"], default="g1")
     parser.add_argument("--fps", type=int, default=None,
                         help="Override output fps; default: the source dataset's meta fps")
+    parser.add_argument("--zero-hands", action="store_true",
+                        help="Robot has no dex hands: zero the hand state/action slices "
+                             "(constant dims are ignored by bounds normalization)")
     args = parser.parse_args()
 
     data_root = Path(args.data_root).expanduser().resolve()
@@ -342,7 +356,7 @@ def main():
     for d in [work_dir / "data", work_dir / "videos", work_dir / "meta"]:
         d.mkdir(parents=True, exist_ok=True)
 
-    pipeline = Sonic2LeRobotConverter()
+    pipeline = Sonic2LeRobotConverter(zero_hands=args.zero_hands)
     pipeline.run(data_root, work_dir, args.chunks_size, args.num_workers, args.robot_type, fps=args.fps)
     pipeline.write_meta(work_dir)
 
