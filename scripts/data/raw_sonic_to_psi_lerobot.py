@@ -29,6 +29,8 @@ logging.getLogger("datasets").setLevel(logging.ERROR)
 
 # --- source (collection) column names ---
 SRC_VIDEO_KEY = "observation.images.ego_view"
+# source camera name -> output video key suffix (observation.images.<out>)
+CAMERA_OUT_NAMES = {"ego_view": "egocentric", "left_wrist": "left_wrist", "right_wrist": "right_wrist"}
 SRC_STATE = "observation.state"            # 43, joint-angle layout below
 SRC_ACTION_WBC = "action.wbc"              # 43, same layout as state
 SRC_MOTION_TOKEN = "action.motion_token"   # 64
@@ -92,7 +94,10 @@ class Sonic2LeRobotConverter:
     ``observation.images.egocentric`` video. Frames are kept 1:1; video is copied.
     """
 
-    def __init__(self, zero_hands: bool = False):
+    def __init__(self, zero_hands: bool = False, cameras: List[str] | None = None):
+        # cameras: source camera names to carry over (default: ego_view only,
+        # matching the original single-view Psi0 SONIC recipe)
+        self.cameras = cameras or ["ego_view"]
         # zero_hands: robot has no dex hands attached; recorded hand values are either
         # all-zero anyway or spurious teleop commands into the void — zero both the
         # hand state and hand action slices so they become constant dims that the
@@ -115,7 +120,7 @@ class Sonic2LeRobotConverter:
         self.lengths_by_episode: Dict[int, int] = {}
         self.chunks_size: int = 1000
         self.fps: int = DEFAULT_FPS                       # taken from the source meta in run()
-        self.video_shape: List[int] = DEFAULT_VIDEO_SHAPE
+        self.video_shapes: Dict[str, List[int]] = {}
 
     def build_obs(self, state43: np.ndarray) -> Dict[str, Any]:
         hands = take_slices(state43, HAND_SLICES)
@@ -144,9 +149,12 @@ class Sonic2LeRobotConverter:
         chunk_path.mkdir(parents=True, exist_ok=True)
         parquet_path = chunk_path / f"episode_{episode_index:06d}.parquet"
 
-        ego_dir = out_base.parent / "videos" / f"chunk-{episode_index // chunks_size:03d}" / "observation.images.egocentric"
-        ego_dir.mkdir(parents=True, exist_ok=True)
-        vid_path = ego_dir / f"episode_{episode_index:06d}.mp4"
+        vid_paths = {}
+        for cam in self.cameras:
+            out_key = f"observation.images.{CAMERA_OUT_NAMES[cam]}"
+            cam_dir = out_base.parent / "videos" / f"chunk-{episode_index // chunks_size:03d}" / out_key
+            cam_dir.mkdir(parents=True, exist_ok=True)
+            vid_paths[cam] = cam_dir / f"episode_{episode_index:06d}.mp4"
 
         df = pd.read_parquet(src_parquet)
         n = len(df)
@@ -175,7 +183,8 @@ class Sonic2LeRobotConverter:
         parquet_tmp = tmp_dir / "episode.parquet"
         Dataset.from_list(rows, features=self.features).to_parquet(str(parquet_tmp))
         os.replace(parquet_tmp, parquet_path)
-        shutil.copyfile(src_video, vid_path)  # already h264/yuv420p
+        for cam in self.cameras:  # already h264/yuv420p
+            shutil.copyfile(src_video[cam], vid_paths[cam])
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
         # per-episode action/timestamp stats -> episodes_stats.jsonl
@@ -207,9 +216,11 @@ class Sonic2LeRobotConverter:
         # so the output meta must match it or LeRobot's timestamp-based decoding breaks.
         src_info = json.loads((data_root / "meta" / "info.json").read_text())
         self.fps = fps or src_info.get("fps") or DEFAULT_FPS
-        src_video_meta = src_info.get("features", {}).get(SRC_VIDEO_KEY, {})
-        self.video_shape = list(src_video_meta.get("shape") or DEFAULT_VIDEO_SHAPE)
-        print(f"Source fps: {self.fps}, video shape: {self.video_shape}")
+        self.video_shapes = {}
+        for cam in self.cameras:
+            m = src_info.get("features", {}).get(f"observation.images.{cam}", {})
+            self.video_shapes[cam] = list(m.get("shape") or DEFAULT_VIDEO_SHAPE)
+        print(f"Source fps: {self.fps}, cameras: {self.cameras}, shapes: {self.video_shapes}")
         data_dir = work_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -229,11 +240,14 @@ class Sonic2LeRobotConverter:
             src_ep = int(pq.stem.split("_")[1])
             desc = ep_task.get(src_ep, "")
             task_idx = task_to_idx.get(desc, 0)
-            video = (
-                data_root / "videos" / f"chunk-{src_ep // chunks_size:03d}"
-                / SRC_VIDEO_KEY / f"episode_{src_ep:06d}.mp4"
-            )
-            assert video.is_file(), f"missing source video: {video}"
+            video = {}
+            for cam in self.cameras:
+                v = (
+                    data_root / "videos" / f"chunk-{src_ep // chunks_size:03d}"
+                    / f"observation.images.{cam}" / f"episode_{src_ep:06d}.mp4"
+                )
+                assert v.is_file(), f"missing source video: {v}"
+                video[cam] = v
             self.episode_sources.append((task_idx, pq, video, out_ep))
             out_ep += 1
 
@@ -290,9 +304,12 @@ class Sonic2LeRobotConverter:
             "video.is_depth_map": False, "has_audio": False,
         }
         features_meta = {
-            "observation.images.egocentric": {
-                "dtype": "video", "shape": self.video_shape,
-                "names": ["height", "width", "channel"], "video_info": video_info,
+            **{
+                f"observation.images.{CAMERA_OUT_NAMES[cam]}": {
+                    "dtype": "video", "shape": self.video_shapes[cam],
+                    "names": ["height", "width", "channel"], "video_info": video_info,
+                }
+                for cam in self.cameras
             },
             "states": {"dtype": "float32", "shape": [-1]},
             "action": {"dtype": "float32", "shape": [-1]},
@@ -310,7 +327,7 @@ class Sonic2LeRobotConverter:
             total_episodes=self.num_episodes,
             total_frames=self.total_frames,
             total_tasks=len(self.tasks_meta),
-            total_videos=self.num_episodes,
+            total_videos=self.num_episodes * len(self.cameras),
             total_chunks=math.ceil(self.num_episodes / self.chunks_size),
             chunks_size=self.chunks_size,
             fps=self.fps,
@@ -344,6 +361,9 @@ def main():
     parser.add_argument("--robot-type", type=str, choices=["g1"], default="g1")
     parser.add_argument("--fps", type=int, default=None,
                         help="Override output fps; default: the source dataset's meta fps")
+    parser.add_argument("--cameras", nargs="+", default=["ego_view"],
+                        choices=list(CAMERA_OUT_NAMES.keys()),
+                        help="source cameras to include (video keys become observation.images.<mapped>)")
     parser.add_argument("--zero-hands", action="store_true",
                         help="Robot has no dex hands: zero the hand state/action slices "
                              "(constant dims are ignored by bounds normalization)")
@@ -356,7 +376,7 @@ def main():
     for d in [work_dir / "data", work_dir / "videos", work_dir / "meta"]:
         d.mkdir(parents=True, exist_ok=True)
 
-    pipeline = Sonic2LeRobotConverter(zero_hands=args.zero_hands)
+    pipeline = Sonic2LeRobotConverter(zero_hands=args.zero_hands, cameras=args.cameras)
     pipeline.run(data_root, work_dir, args.chunks_size, args.num_workers, args.robot_type, fps=args.fps)
     pipeline.write_meta(work_dir)
 
