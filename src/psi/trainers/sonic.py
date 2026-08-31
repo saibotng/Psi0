@@ -370,8 +370,9 @@ class SonicTrainer(Trainer):
             # Log up to 4 images for visualization: concat them horizontally into one image
             img_arrays = []
             for i in range(min(10, len(raw_imgs))):
-                img = raw_imgs[i][0]  # t=0
-                img_arrays.append(img)
+                # tile ALL camera views of the sample side by side (was: view 0 only)
+                views = [np.asarray(v) for v in raw_imgs[i]]
+                img_arrays.append(np.concatenate(views, axis=1) if len(views) > 1 else views[0])
 
             # Images are assumed to have same shape and 3 channels; concat directly
             concat_img = np.concatenate(img_arrays, axis=1)

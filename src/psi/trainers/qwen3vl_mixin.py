@@ -56,8 +56,13 @@ class PaddedCollatorForActionPrediction:
         else:
             raise ValueError(f"Unsupported pixel_values type: {type(pixel_values[0])}")
 
-        # Stack image_grid_thw
-        image_grid_thw = torch.stack([instance["image_grid_thw"].squeeze(0) for instance in instances])
+        # Concatenate image_grid_thw to (total_images, 3). Stacking squeezed rows
+        # only works for exactly one image per sample; with N views per sample the
+        # per-sample grid is (N, 3) and stacking produces a 3-D tensor that breaks
+        # Qwen3VL's pos-embed interpolation (linspace gets a 1-D tensor as steps).
+        image_grid_thw = torch.cat(
+            [instance["image_grid_thw"].reshape(-1, 3) for instance in instances], dim=0
+        )
 
         # Build output
         output = {
@@ -120,8 +125,13 @@ class PaddedCollatorForTogether:
         else:
             raise ValueError(f"Unsupported pixel_values type: {type(pixel_values[0])}")
 
-        # Stack image_grid_thw
-        image_grid_thw = torch.stack([instance["image_grid_thw"].squeeze(0) for instance in instances])
+        # Concatenate image_grid_thw to (total_images, 3). Stacking squeezed rows
+        # only works for exactly one image per sample; with N views per sample the
+        # per-sample grid is (N, 3) and stacking produces a 3-D tensor that breaks
+        # Qwen3VL's pos-embed interpolation (linspace gets a 1-D tensor as steps).
+        image_grid_thw = torch.cat(
+            [instance["image_grid_thw"].reshape(-1, 3) for instance in instances], dim=0
+        )
 
         # Build output
         output = {
