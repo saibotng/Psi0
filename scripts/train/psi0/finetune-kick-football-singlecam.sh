@@ -12,7 +12,7 @@ NPROC_PER_NODE=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
 ulimit -n 65535
 echo "Training with $NPROC_PER_NODE GPUs"
 
-PSI_HOME=${PSI_HOME:-/home/innovation-hacking/luebbet/g1_vla_workspace/psi_home}
+PSI_HOME=${PSI_HOME:-/home/innovation-hacking/luebbet/g1_vla_workspace/external/Psi0/psi_home}
 OUT_DIR=${OUT_DIR:-/home/innovation-hacking/luebbet/g1_vla_workspace/models}
 RUN_NAME=${RUN_NAME:-psi0_g1_wbc_kick_football_singlecam}
 
