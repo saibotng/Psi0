@@ -81,9 +81,20 @@ class RealTimeChunkController:
 
         self.M = threading.Lock()
         self.C = threading.Condition(self.M)
+        self._stopped = False
 
         self._infer_th = threading.Thread(target=self._inference_loop, daemon=True)
         self._infer_th.start()
+
+    def stop(self, timeout: float = 5.0):
+        """Stop the inference thread. After this the controller must not be stepped
+        again; the server creates a fresh controller for the next client session."""
+        with self.C:
+            self._stopped = True
+            self.C.notify_all()
+        self._infer_th.join(timeout=timeout)
+        if self._infer_th.is_alive():
+            print("[RTC] WARNING: inference thread did not stop within timeout")
 
         
     def step(self, obs_next: Dict[str, Any]): # consume a_(t-1) and provide o_t
@@ -99,11 +110,13 @@ class RealTimeChunkController:
             return single_action[np.newaxis, :] # (1, D)
 
     def _inference_loop(self):
-        while True:
+        while not self._stopped:
             with self.C:
                 try:
-                    while self.t < self.s_min:
+                    while self.t < self.s_min and not self._stopped:
                         self.C.wait() # wait until notified and get the lock
+                    if self._stopped:
+                        break
                     s   = self.t
 
                     # FIXME: 
@@ -230,6 +243,8 @@ class Server:
 
         self.controller = None
         self._control_loop_started = False
+        self._control_stop = threading.Event()
+        self._control_thread = None
         
         # WebSocket: asyncio event to notify when new action is ready
         self.app = FastAPI()
@@ -314,7 +329,12 @@ class Server:
         """
         await websocket.accept()
         self._active_websocket = websocket
-        
+
+        # Every client session starts from a clean slate: drop any controller
+        # left over from a previous session (its action chunk / RTC prefix
+        # would otherwise seed the new run) and stop stepping on stale obs.
+        self._stop_control_loop()
+
         # Create asyncio event for action notification
         self._action_ready_event = asyncio.Event()
         
@@ -396,7 +416,12 @@ class Server:
                         await websocket.send_text(json.dumps(resp_dict))
                         print(f"[WebSocket] Sent action, version={version}")
                     else:
-                        assert False, "action is None"
+                        # Benign race: a control tick landed between event.clear()
+                        # and the latest_action reset above, so the event was
+                        # re-set for an action that was already sent. Skipping is
+                        # correct; raising here used to kill this coroutine and
+                        # silently stop ALL action delivery for the session.
+                        print(f"[WebSocket] spurious wake-up (action already sent, version={version}) — skipping")
                         
             except WebSocketDisconnect:
                 print("[WebSocket] Client disconnected (send)")
@@ -410,6 +435,10 @@ class Server:
             print(f"[WebSocket] Connection closed: {e}")
         finally:
             self._active_websocket = None
+            self._action_ready_event = None
+            # No client -> no stepping. The controller keeps no state across
+            # sessions; the next connection re-initializes from its first obs.
+            self._stop_control_loop()
             print("[WebSocket] Handler finished")
 
     def _start_control_loop(self):
@@ -425,9 +454,30 @@ class Server:
         self.controller = self._init_controller(o_first) # wait for model warm up
         
         # Start control loop thread
+        self._control_stop = threading.Event()
         self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
         self._control_thread.start()
-        print("[control loop] started")
+        print("[control loop] started (fresh controller for this client session)")
+
+    def _stop_control_loop(self):
+        """Tear down the control loop and the RTC controller (no-op if not running)."""
+        if not self._control_loop_started:
+            return
+        self._control_stop.set()
+        if self._control_thread is not None:
+            self._control_thread.join(timeout=2.0)
+            if self._control_thread.is_alive():
+                print("[control loop] WARNING: control thread did not stop within timeout")
+        self._control_thread = None
+        if self.controller is not None:
+            self.controller.stop()
+        self.controller = None
+        with self.obs_lock:
+            self.latest_obs = None
+        with self.action_lock:
+            self.latest_action = None
+        self._control_loop_started = False
+        print("[control loop] stopped — controller discarded, next client session starts clean")
 
     def _control_loop(self):
         """
@@ -436,13 +486,16 @@ class Server:
         """
         next_tick = time.perf_counter()
         prev_tick = time.perf_counter()
+        stop = self._control_stop
         
-        while True:
+        while not stop.is_set():
             # loop_start = time.time()
             
             # 1. Get latest obs
             with self.obs_lock:
                 obs_next = copy.deepcopy(self.latest_obs)
+            if obs_next is None:  # being torn down
+                break
             
             # 2. Execute step
             action = self.controller.step(obs_next) # (1, D)
@@ -454,10 +507,11 @@ class Server:
                 self.action_version += 1
             
             # 4. Notify WebSocket that new action is ready
-            if self._action_ready_event is not None:
+            ready_event = self._action_ready_event  # may be cleared by the handler concurrently
+            if ready_event is not None and self._loop is not None:
                 # Thread-safe way to set asyncio event from another thread
                 try:
-                    self._loop.call_soon_threadsafe(self._action_ready_event.set)
+                    self._loop.call_soon_threadsafe(ready_event.set)
                 except Exception as e:
                     print(f"[control loop] Failed to notify WebSocket: {e}")
             
