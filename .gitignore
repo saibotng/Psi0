@@ -59,4 +59,5 @@ test.py
 unitree_sdk2_python
 
 src/h_rdt/datasets/pretrain/egodex_large_values.txt
-.claude/psi_home/
+.claude/
+psi_home/
