@@ -328,16 +328,22 @@ class Server:
         - Send action to client immediately when new action is ready
         """
         await websocket.accept()
-        self._active_websocket = websocket
 
         # Every client session starts from a clean slate: drop any controller
         # left over from a previous session (its action chunk / RTC prefix
         # would otherwise seed the new run) and stop stepping on stale obs.
         self._stop_control_loop()
+        self._active_websocket = websocket
 
-        # Create asyncio event for action notification
-        self._action_ready_event = asyncio.Event()
-        
+        # Per-session action event. The control loop notifies whatever event is
+        # current; this session's sender only ever waits on its own, so a late
+        # teardown of an older session can no longer detach the new one.
+        ready_event = asyncio.Event()
+        self._action_ready_event = ready_event
+
+        def is_current() -> bool:
+            return self._active_websocket is websocket
+
         print("[WebSocket] Client connected")
         async def receive_obs():
             """Continuously receive obs from client"""
@@ -345,6 +351,9 @@ class Server:
                 while True:
                     # Receive obs from client
                     data = await websocket.receive_text()
+                    if not is_current():
+                        print("[WebSocket] superseded by a newer client — ending this session")
+                        return
                     payload = json.loads(data)
                     interval = time.time() - self.start_time_obs
                     self.start_time_obs = time.time()
@@ -395,8 +404,10 @@ class Server:
             try:
                 while True:
                     # Wait for new action to be ready
-                    await self._action_ready_event.wait()
-                    self._action_ready_event.clear()
+                    await ready_event.wait()
+                    ready_event.clear()
+                    if not is_current():
+                        return
 
                     interval = time.time() - self.start_time
                     self.start_time = time.time()
@@ -428,18 +439,29 @@ class Server:
             except Exception as e:
                 print(f"[WebSocket] Send error: {e}")
         
+        recv_task = asyncio.create_task(receive_obs())
+        send_task = asyncio.create_task(send_action())
         try:
-            # Run both tasks concurrently
-            await asyncio.gather(receive_obs(), send_action())
+            # Whichever side ends first ends the session: a disconnect is seen by
+            # the receiver, and the sender would otherwise keep waiting on its
+            # event (used to delay this teardown until after a new client had
+            # already connected — which then detached the new session).
+            _, pending = await asyncio.wait({recv_task, send_task}, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         except Exception as e:
             print(f"[WebSocket] Connection closed: {e}")
         finally:
-            self._active_websocket = None
-            self._action_ready_event = None
-            # No client -> no stepping. The controller keeps no state across
-            # sessions; the next connection re-initializes from its first obs.
-            self._stop_control_loop()
-            print("[WebSocket] Handler finished")
+            if is_current():
+                self._active_websocket = None
+                self._action_ready_event = None
+                # No client -> no stepping. The controller keeps no state across
+                # sessions; the next connection re-initializes from its first obs.
+                self._stop_control_loop()
+                print("[WebSocket] Handler finished")
+            else:
+                print("[WebSocket] Handler finished (a newer session owns the controller — left untouched)")
 
     def _start_control_loop(self):
         """Start control loop thread"""
@@ -451,11 +473,15 @@ class Server:
         with self.obs_lock:
             o_first = copy.deepcopy(self.latest_obs)
             
-        self.controller = self._init_controller(o_first) # wait for model warm up
-        
-        # Start control loop thread
-        self._control_stop = threading.Event()
-        self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
+        controller = self._init_controller(o_first) # wait for model warm up
+        self.controller = controller
+
+        # Start control loop thread. It gets its own controller and stop event, so
+        # a thread that outlives a teardown (join timeout) can never step the
+        # controller of the next session.
+        stop = threading.Event()
+        self._control_stop = stop
+        self._control_thread = threading.Thread(target=self._control_loop, args=(controller, stop), daemon=True)
         self._control_thread.start()
         print("[control loop] started (fresh controller for this client session)")
 
@@ -479,14 +505,13 @@ class Server:
         self._control_loop_started = False
         print("[control loop] stopped — controller discarded, next client session starts clean")
 
-    def _control_loop(self):
+    def _control_loop(self, controller, stop: threading.Event):
         """
         Control loop: Execute controller.step strictly every CTRL_PERIOD_SEC
         And expect at next time, the obs_next sent from client is the one after executing the action
         """
         next_tick = time.perf_counter()
         prev_tick = time.perf_counter()
-        stop = self._control_stop
         
         while not stop.is_set():
             # loop_start = time.time()
@@ -498,7 +523,7 @@ class Server:
                 break
             
             # 2. Execute step
-            action = self.controller.step(obs_next) # (1, D)
+            action = controller.step(obs_next) # (1, D)
             pred_action = self._postprocess_action(action) # (1, D)
             
             # 3. Update latest_action
